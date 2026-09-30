@@ -28,9 +28,9 @@ from simulation.config import Config
 MAX_DUTY_HOURS = Config.max_duty_hours
 MIN_REST_HOURS = Config.min_rest_hours
 MIN_CONNECTION_MINUTES = Config.min_connection_minutes
-MAX_DUTY_HOURS_7D = Config.max_duty_hours_7D
-MAX_DUTY_HOURS_14D = Config.max_duty_hours_14D
-MAX_DUTY_HOURS_28D = Config.max_duty_hours_28D
+MAX_DUTY_HOURS_7D = Config.max_duty_hours_7d
+MAX_DUTY_HOURS_14D = Config.max_duty_hours_14d
+MAX_DUTY_HOURS_28D = Config.max_duty_hours_28d
 PRE_DUTY_MINUTES = Config.pre_duty_minutes
 POST_DUTY_MINUTES = Config.post_duty_minutes
 
