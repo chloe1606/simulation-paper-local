@@ -1,11 +1,11 @@
-"""Run end-to-end simulation using DFS workbook and crew_assignment_fact."""
+"""Run end-to-end simulation using input flight data."""
 
 import io
 from pathlib import Path
 import utility.metrics as metrics
 from simulation import SimulationEngine, Config, optimize_roster_max_coverage
 from utility.flight_data_generator import main as generate_input_data
-from utility.validation import validate_roster
+from simulation.validation.validation import validate_roster
 
 
 def run_simulation(debug: bool = False) -> SimulationEngine:
@@ -22,7 +22,7 @@ def run_simulation(debug: bool = False) -> SimulationEngine:
     input_workbook = Config.input_file
     try:
         generate_input_data(
-            active_crew=24,
+            active_crew=30,
             standby_crew=0
         )
     except PermissionError as exc:
