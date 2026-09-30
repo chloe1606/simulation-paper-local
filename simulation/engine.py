@@ -1,8 +1,9 @@
-"""SimulationEngine: runs delay/absence simulation using DFS workbook + crew_assignment_fact."""
+"""SimulationEngine: runs delay/absence simulation using delta tables (Databricks) or an Excel workbook (local)."""
 
+import os
 import random
 from collections import deque
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import pandas as pd
@@ -20,12 +21,36 @@ from .flight_ops import (
 )
 from .crew_ops import add_unavailable_records
 
+# ============================================================
+# ENVIRONMENT DETECTION
+# ============================================================
+# Databricks sets this env var automatically. Locally (e.g. VS Code) it's
+# absent, so IS_DATABRICKS is False there.
+IS_DATABRICKS = "DATABRICKS_RUNTIME_VERSION" in os.environ
 
+try:
+    from pyspark.sql import DataFrame as SparkDataFrame
+    from pyspark.sql import SparkSession
+
+    HAS_PYSPARK = True
+except ImportError:
+    SparkDataFrame = None  # type: ignore[assignment]
+    SparkSession = None  # type: ignore[assignment]
+    HAS_PYSPARK = False
+
+VERBOSE = False
+# Delta export is opt-in and requires pyspark - only flip this on when
+# actually running on Databricks. Locally it's simply unavailable.
+SAVE_TO_DELTA = False
+TO_BE_ARCHIVED = False
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_INPUT_FILE = Path(Config.input_file)  # Default input file path relative to project root
-REQUIRED_SHEETS = [
+
+# The tables actually needed to build flights/crew/roster. (duty_fact isn't
+# read here - every flight row already carries its own Duty ID - so it's
+# intentionally left out of this list even though the source workbook/tables
+# may include it.)
+REQUIRED_TABLES = [
     "flight_schedule_fact",
-    "duty_fact",
     "sectors_dim",
     "aircraft_dim",
     "crew_dim",
@@ -41,20 +66,54 @@ def _to_int(series: pd.Series) -> pd.Series:
     return pd.to_numeric(series, errors="coerce").round().astype("Int64")
 
 
-def load_data(file_path: str | Path) -> dict:
-    """Load DFS workbook and produce runtime flights/crew/roster tables."""
+def _to_pandas(df):
+    """Convert a Spark DataFrame to pandas; pass pandas DataFrames through untouched."""
+    if isinstance(df, pd.DataFrame):
+        return df
+    if HAS_PYSPARK and isinstance(df, SparkDataFrame):
+        return df.toPandas()
+    if hasattr(df, "toPandas"):
+        # Duck-typed fallback in case the SparkDataFrame import path differs.
+        return df.toPandas()
+    return df
 
-    input_path = Path(file_path)
+
+def _load_tables(delta_tables: dict | None = None, input_file: str | Path | None = None) -> dict[str, pd.DataFrame]:
+    """Load the required delta tables from in-memory delta_tables (Spark or pandas -
+    typically Databricks/Delta) or from an Excel workbook (typically local)."""
+
+    if delta_tables is not None:
+        missing = [table for table in REQUIRED_TABLES if table not in delta_tables]
+        if missing:
+            raise ValueError(f"Missing required tables: {missing}")
+        return {name: _to_pandas(delta_tables[name]) for name in REQUIRED_TABLES}
+
+    if input_file is None:
+        raise ValueError(
+            "No delta_tables provided and no input_file configured to load from "
+            "(expected on Databricks - pass delta_tables directly from Delta tables)."
+        )
+
+    input_path = Path(input_file)
     workbook = pd.ExcelFile(input_path)
-    missing = [sheet for sheet in REQUIRED_SHEETS if sheet not in workbook.sheet_names]
+    missing = [table for table in REQUIRED_TABLES if table not in workbook.sheet_names]
     if missing:
         raise ValueError(f"Missing required sheets in {input_path}: {missing}")
 
-    flight_schedule_fact = pd.read_excel(input_path, sheet_name="flight_schedule_fact")
-    sectors_dim = pd.read_excel(input_path, sheet_name="sectors_dim")
-    aircraft_dim = pd.read_excel(input_path, sheet_name="aircraft_dim")
-    crew_dim = pd.read_excel(input_path, sheet_name="crew_dim")
-    crew_assignment_fact = pd.read_excel(input_path, sheet_name="crew_assignment_fact")
+    return {name: pd.read_excel(input_path, sheet_name=name) for name in REQUIRED_TABLES}
+
+
+def load_data(delta_tables: dict | None = None, input_file: str | Path | None = None) -> dict:
+    """Build runtime flights, crew and roster tables from delta tables (dict of
+    Spark/pandas DataFrames) or an Excel workbook - whichever is provided."""
+
+    tables = _load_tables(delta_tables=delta_tables, input_file=input_file)
+
+    flight_schedule_fact = tables["flight_schedule_fact"]
+    sectors_dim = tables["sectors_dim"]
+    aircraft_dim = tables["aircraft_dim"]
+    crew_dim = tables["crew_dim"]
+    crew_assignment_fact = tables["crew_assignment_fact"]
 
     fs = flight_schedule_fact.merge(
         sectors_dim[["sector_id", "origin", "destination"]],
@@ -164,20 +223,47 @@ def load_data(file_path: str | Path) -> dict:
     }
 
 
-
 class SimulationEngine:
     """Encapsulates simulation state so each run is independent."""
 
-    def __init__(self, config: Config = None, input_file: str | Path | None = None):
+    def __init__(
+        self,
+        delta_tables: dict | None = None,
+        seed=None,
+        delay_prob=None,
+        absence_prob=None,
+        config: Config | None = None,
+        input_file: str | Path | None = None,
+    ):
+        # Guard against the local calling convention `SimulationEngine(config)`,
+        # where config is passed as the first positional argument. Since that
+        # slot is normally `delta_tables` (the Databricks-style convention), a
+        # bare Config instance would otherwise be mistaken for a tables dict.
+        if isinstance(delta_tables, Config):
+            config = delta_tables
+            delta_tables = None
+
         self.config = config or Config()
 
-        # Resolve relative paths from the v2 project root rather than the shell cwd.
-        chosen_input = Path(input_file or self.config.input_file or DEFAULT_INPUT_FILE)
-        if not chosen_input.is_absolute():
-            chosen_input = PROJECT_ROOT / chosen_input
-        self.input_file = str(chosen_input)
+        # seed / delay_prob / absence_prob can be overridden explicitly (e.g.
+        # from a notebook sweeping values); otherwise fall back to config.
+        self.seed = seed if seed is not None else self.config.seed
+        self.delay_prob = delay_prob if delay_prob is not None else self.config.delay_probability
+        self.absence_prob = absence_prob if absence_prob is not None else self.config.absence_probability
 
-        data = load_data(self.input_file)
+        if delta_tables is not None:
+            data = load_data(delta_tables=delta_tables)
+        else:
+            if IS_DATABRICKS:
+                raise ValueError(
+                    "No delta_tables provided on Databricks - pass delta_tables directly "
+                    "from Delta tables (there's no Excel input file to fall back to here)."
+                )
+            chosen_input = Path(input_file or self.config.input_file)
+            if not chosen_input.is_absolute():
+                chosen_input = PROJECT_ROOT / chosen_input
+            data = load_data(input_file=chosen_input)
+
         self.flights = data["flights"]
         self.crew = data["crew"]
         self.roster_df = data["roster_df"]
@@ -194,33 +280,45 @@ class SimulationEngine:
         self.duty_overrun_cancellations = 0
         self.excessive_delay_cancellations = 0
         self.curfew_cancellations = 0
-        self.crew_reassignments = 0
-        self.reassigned_duties = set()
         self.primary_delay_minutes = 0
         self.secondary_delay_minutes = 0
         self.total_delay_minutes = 0
 
+        # === Search-time rejection counters ===
+        self.num_rejections_6in9 = 0                   # candidate-level 6-in-9 rejections (find_replacement)
+        self.flights_with_rolling_window_issues = 0    # flight-level: eligible candidate found only after
+                                                        # passing over >=1 rolling-window rejection
+
+        # === Successful-recovery stats (committed only after verify_minimum_crew confirms) ===
+        self.crew_reassignments = 0                    # count of confirmed successful replacements
+        self.reassigned_duties = set()                 # unique Duty IDs that got a confirmed replacement
+        self.num_recoveries_by_reserve = 0             # of the above, how many used standby/reserve crew
+        self.crew_found_delays = []                    # delay_hours for every confirmed resolution (incl. 0h)
+                                                        # -> feeds compute_avg_time_before_crew_found()
+        self.assignment_delays = []                    # delay_hours only where > 0
+                                                        # -> feeds compute_avg_assignment_delay()
+
+        # === Uncovered-duty reason counters (contributing-factor style - NOT mutually exclusive
+        #     a single duty can increment more than one of these) ===
+        self.uncovered_due_to_rest = 0
+        self.uncovered_due_to_no_reserve = 0
+        self.uncovered_due_to_absence = 0
+        self.uncovered_due_to_duty_limit = 0
+        self.uncovered_due_to_rolling_window = 0
+        self.uncovered_due_to_connection = 0
+        self.uncovered_due_to_airport_mismatch = 0
+        self.uncovered_due_to_schedule_conflict = 0
+        self.uncovered_due_to_curfew = 0
+        self.uncovered_due_to_excessive_delay = 0
+        self.uncovered_due_to_duty_overrun = 0
+        self.uncovered_due_to_delay_limit = 0           # fallback only - should stay 0 in practice
+        self.uncovered_due_to_insufficient_crew = 0
+
+        # === Mutually-exclusive top-line breakdown (sums to 100% of uncovered duties) ===
+        self.primary_uncovered_reasons = {}             # dict: reason string -> count, populated lazily
+
     def sim_time_to_datetime(self, env):
         return self.simulation_start + timedelta(hours=env.now)
-    
-    def record_reassignment(
-        self,
-        duty_id: str,
-        old_crew_id: str,
-        new_crew_id: str,
-    ):
-        """
-        Record a successful crew replacement.
-        """
-
-        self.crew_reassignments += 1
-        self.reassigned_duties.add(duty_id)
-
-        print(
-            f"[REPLACE] "
-            f"Duty={duty_id} "
-            f"{old_crew_id} -> {new_crew_id}"
-        )
 
     def _sample_delay(self):
         cfg = self.config
@@ -228,45 +326,6 @@ class SimulationEngine:
         clamped = max(cfg.delay_min_minutes, min(cfg.delay_max_minutes, raw))
         rounded = round(clamped / cfg.delay_step_minutes) * cfg.delay_step_minutes
         return int(rounded)
-
-    def _compute_absence_probability(self, crew_member, current_dt):
-        cfg = self.config
-
-        if not cfg.absence_probability_equation:
-            return cfg.absence_probability
-
-        window_start = current_dt - timedelta(days=28)
-
-        crew_duties = self.roster_df[
-            (self.roster_df["Crew ID"] == crew_member.id)
-            & (self.roster_df["Assignment Status"] == "Assigned")
-            & (pd.to_datetime(self.roster_df["Actual Departure datetime"]) >= window_start)
-            & (pd.to_datetime(self.roster_df["Actual Departure datetime"]) <= current_dt)
-        ].copy()
-
-        if crew_duties.empty:
-            return cfg.absence_probability
-
-        crew_duties["_dep_dt"] = pd.to_datetime(crew_duties["Actual Departure datetime"])
-        crew_duties["_dep_date"] = crew_duties["_dep_dt"].dt.date
-
-        worked_dates = sorted(crew_duties["_dep_date"].unique(), reverse=True)
-        consecutive = 0
-        prev = current_dt.date()
-        for d in worked_dates:
-            if (prev - d).days <= 1:
-                consecutive += 1
-                prev = d
-            else:
-                break
-
-        days_worked = len(worked_dates)
-        days_off = 28 - days_worked
-
-        p = cfg.absence_probability
-        p += cfg.fatigue_consecutive_weight * max(0, consecutive - cfg.fatigue_consecutive_threshold)
-        p += cfg.fatigue_rest_deficit_weight * max(0, cfg.fatigue_rest_deficit_threshold - days_off)
-        return min(p, cfg.fatigue_max_probability)
 
     def _check_overrun(self, duty_id):
         cancelled = check_duty_overrun(self.flights, self.roster_df, duty_id, self.config)
@@ -280,17 +339,18 @@ class SimulationEngine:
         cancelled = check_curfew(self.flights, self.roster_df, duty_id, self.config)
         self.curfew_cancellations += cancelled
 
-    def _absence_process(self, env, crew_member):
+    def _absence_process(self, env, crew_member, absence_prob):
         while True:
             yield env.timeout(24)
 
             current_dt = self.sim_time_to_datetime(env)
-            p_absent = self._compute_absence_probability(crew_member, current_dt)
+            p_absent = absence_prob
 
             if random.random() < p_absent:
                 crew_member.absent = True
 
-                print(f"[SICK] {current_dt:%Y-%m-%d %H:%M} | {crew_member.id} became unavailable")
+                if VERBOSE:
+                    print(f"[SICK] {current_dt:%Y-%m-%d %H:%M} | {crew_member.id} became unavailable")
 
                 add_unavailable_records(
                     crew_member,
@@ -299,17 +359,18 @@ class SimulationEngine:
                     self.roster_df,
                     self.replacement_queue,
                     self.config,
-                    self
+                    self,
                 )
 
                 sick_duration = random.choice(self.config.sick_duration_options)
                 yield env.timeout(sick_duration)
 
                 crew_member.absent = False
-                print(
-                    f"[RETURN] {self.sim_time_to_datetime(env):%Y-%m-%d %H:%M} | "
-                    f"{crew_member.id} returned to service"
-                )
+                if VERBOSE:
+                    print(
+                        f"[RETURN] {self.sim_time_to_datetime(env):%Y-%m-%d %H:%M} | "
+                        f"{crew_member.id} returned to service"
+                    )
 
     def _delay_process(self, env):
         previous_hours = 0
@@ -320,13 +381,14 @@ class SimulationEngine:
             yield env.timeout(max(0, departure_hours - previous_hours))
             previous_hours = departure_hours
 
-            if random.random() < self.config.delay_probability:
+            if random.random() < self.delay_prob:
                 delay = self._sample_delay()
+
                 self.primary_delay_minutes += delay
+
                 flight_number = flight["Flight Number"]
                 duty_id = flight["Duty ID"]
                 idx = self.flights[self.flights["Flight Number"] == flight_number].index
-
 
                 if self.flights.loc[idx, "Cancelled"].iloc[0] == 1:
                     continue
@@ -336,11 +398,11 @@ class SimulationEngine:
 
                 refresh_roster_actual_times(self.flights, self.roster_df)
                 self.roster_df.loc[self.roster_df["Flight Number"] == flight_number, "Flight Delayed"] = 1
-
-                print(
-                    f"[DELAY] {flight['Departure datetime']:%Y-%m-%d %H:%M} | "
-                    f"{flight_number} delayed by {delay} mins | reason: random delay"
-                )
+                if VERBOSE:
+                    print(
+                        f"[DELAY] {flight['Departure datetime']:%Y-%m-%d %H:%M} | "
+                        f"{flight_number} delayed by {delay} mins | reason: random delay"
+                    )
 
                 propagate_connection_delays(self.flights, self.roster_df, flight_number, self.config, self)
                 propagate_rest_delays(self.flights, self.roster_df, duty_id, self.config, self)
@@ -350,13 +412,12 @@ class SimulationEngine:
                 self._check_curfew(duty_id)
 
     def run(self):
-        if self.config.seed is not None:
-            random.seed(self.config.seed)
+        random.seed(self.seed)
 
         env = simpy.Environment()
 
         for crew_member in self.crew_pool:
-            env.process(self._absence_process(env, crew_member))
+            env.process(self._absence_process(env, crew_member, self.absence_prob))
 
         env.process(self._delay_process(env))
 
@@ -367,20 +428,22 @@ class SimulationEngine:
         env.run(until=simulation_end)
 
         total_cancelled = (self.flights["Cancelled"] == 1).sum()
-        total_delay_minutes = (self.primary_delay_minutes + self.secondary_delay_minutes)
-        
-        print(f"\nSimulation complete. Total roster records: {len(self.roster_df)}")
-        if self.duty_overrun_cancellations > 0:
-            print(f"  Duty overrun cancellations: {self.duty_overrun_cancellations} flights")
-        if self.excessive_delay_cancellations > 0:
-            print(f"  Excessive delay cancellations: {self.excessive_delay_cancellations} flights")
-        if self.curfew_cancellations > 0:
-            print(f"  Curfew cancellations: {self.curfew_cancellations} flights")
-        if total_cancelled > 0:
-            print(f"  Total cancelled: {total_cancelled} flights")
+        total_delay_minutes = self.primary_delay_minutes + self.secondary_delay_minutes
+        self.total_delay_minutes = total_delay_minutes
+
+        if VERBOSE:
+            print(f"\nSimulation complete. Total roster records: {len(self.roster_df)}")
+            if self.duty_overrun_cancellations > 0:
+                print(f"  Duty overrun cancellations: {self.duty_overrun_cancellations} flights")
+            if self.excessive_delay_cancellations > 0:
+                print(f"  Excessive delay cancellations: {self.excessive_delay_cancellations} flights")
+            if self.curfew_cancellations > 0:
+                print(f"  Curfew cancellations: {self.curfew_cancellations} flights")
+            if total_cancelled > 0:
+                print(f"  Total cancelled: {total_cancelled} flights")
 
     def _build_export_tables(self) -> dict[str, pd.DataFrame]:
-        """Build DFS-style export tables from simulated state."""
+        """Build delta-style export tables from simulated state."""
 
         flights = self.flights.copy().sort_values(["Departure datetime", "Flight Number"]).reset_index(drop=True)
         flights["Flight Number"] = _to_string(flights["Flight Number"])
@@ -561,10 +624,49 @@ class SimulationEngine:
             "crew_assignment_fact": crew_assignment_fact,
         }
 
+    def _save_delta_table(self, tables):
+        if not HAS_PYSPARK:
+            raise RuntimeError(
+                "_save_delta_table() requires pyspark, which isn't available in this "
+                "environment. Set SAVE_TO_DELTA = False when running locally, or run "
+                "this on a Databricks cluster."
+            )
+
+        catalog = "ctl-sandbox-dev"
+        schema = "simulation_paper"
+
+        timestamp = pd.Timestamp.now().strftime("%Y%m%d%H%M%S")
+
+        spark = SparkSession.getActiveSession()
+        if spark is None:
+            spark = SparkSession.builder.getOrCreate()
+
+        for table_name, pdf in tables.items():
+            # Only export fact tables
+            if "_fact" not in table_name:
+                continue
+
+            if TO_BE_ARCHIVED:
+                target_table = f"`{catalog}`.{schema}.{timestamp}_post_sim_{table_name}"
+            else:
+                target_table = f"`{catalog}`.{schema}.{table_name}"
+
+            sdf = spark.createDataFrame(pdf)
+            (
+                sdf.write.format("delta")
+                .mode("overwrite")
+                .option("overwriteSchema", "true")
+                .saveAsTable(target_table)
+            )
+
+            row_count = sdf.count()
+            if VERBOSE:
+                print(f"Written {row_count:,} rows to {target_table}")
+
     def save(self):
-        output_path = Path(self.config.output_file)
-        if not output_path.is_absolute():
-            output_path = PROJECT_ROOT / output_path
+        # Output filename is timestamp-distinguished rather than driven by
+        # config, so repeated runs never clobber each other's results.
+        output_path = PROJECT_ROOT / "output" / f"simulation_results_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
         tables = self._build_export_tables()
@@ -577,4 +679,8 @@ class SimulationEngine:
             tables["crew_dim"].to_excel(writer, sheet_name="crew_dim", index=False)
             tables["crew_assignment_fact"].to_excel(writer, sheet_name="crew_assignment_fact", index=False)
 
-        print(f"\n{output_path} saved successfully")
+        if VERBOSE:
+            print(f"\n{output_path} saved successfully")
+
+        if SAVE_TO_DELTA:
+            self._save_delta_table(tables)

@@ -39,31 +39,43 @@ def run_simulation(debug: bool = False) -> SimulationEngine:
 
     # Load the optimized assignment workbook into a roster-shaped dataframe
     # before running disruptions, so validation can check baseline constraints.
-    engine = SimulationEngine(config)
+    engine = SimulationEngine(config=config)
 
     print("\n" + "=" * 60)
     print("VALIDATE OUTPUT AFTER OPTIMIZATION")
     print("=" * 60)
     validate_roster(engine.roster_df)
 
-    # print("\n" + "=" * 60)
-    # print("STEP 3: RUN DELAY SIMULATION")
-    # print("=" * 60)
-    # buf = io.StringIO()
-    # engine.run()
-    # engine.save()
-    # sim_log = buf.getvalue()
+    print("\n" + "=" * 60)
+    print("STEP 3: RUN DELAY SIMULATION")
+    print("=" * 60)
+    buf = io.StringIO()
+    engine.run()
+    engine.save()
+    sim_log = buf.getvalue()
 
-    # print("\n" + "=" * 60)
-    # print("VALIDATE OUTPUT AFTER SIMULATION")
-    # print("=" * 60)
-    # validate_roster(engine.roster_df)
+    print("\n" + "=" * 60)
+    print("VALIDATE OUTPUT AFTER SIMULATION")
+    print("=" * 60)
+    validate_roster(engine.roster_df)
 
-    # metrics.compute_key_metrics(engine, sim_log)
-    # print(metrics.compute_key_metrics(engine, sim_log)[0])
-    # print(metrics.compute_key_metrics(engine, sim_log)[1])
+    _, key_metrics = metrics.compute_key_metrics(engine, sim_log)
+    requested_metrics = [
+        "Flight completion rate (%)",
+        "Duty coverage (%)",
+        "Scheduled flights",
+        "On-time flights",
+        "Cancelled flights",
+        "Total delay (min)",
+        "Delay propagation factor",
+    ]
+    print(
+        key_metrics.loc[
+            key_metrics["Metric"].isin(requested_metrics), ["Metric", "Value"]
+        ].to_string(index=False)
+    )
 
-    # return engine
+    return engine
 
 
 def main() -> None:
