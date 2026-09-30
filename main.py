@@ -7,7 +7,6 @@ from utility.validation import validate_roster
 def main(debug: bool = False) -> SimulationEngine:
     config = Config(
         input_file="input/airline inputs.xlsx",
-        roster_file="output/heuristic_roster.xlsx",
         output_file="output/post_simulation_roster.xlsx",
         debug=debug,
     )

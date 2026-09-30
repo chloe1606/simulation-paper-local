@@ -52,5 +52,4 @@ class Config:
 
     # --- File paths (local/Excel workflow only — unused on Databricks, which reads/writes Delta tables) ---
     input_file: str = "input/airline_inputs.xlsx"
-    roster_file: str = "input/heuristic_roster.xlsx"
     output_file: str = "output/optimiser_output.xlsx"
