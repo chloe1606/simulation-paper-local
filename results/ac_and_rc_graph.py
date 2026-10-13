@@ -1,3 +1,32 @@
+# ------------------------------------------------------------------
+# PURPOSE
+# ------------------------------------------------------------------
+# This script analyses crew resilience simulation results and produces
+# publication-quality plots showing how Flight Completion Rate (FCR)
+# changes as crew absence probability increases.
+#
+# The script:
+# 1. Loads simulation results from an Excel file.
+# 2. Filters for the "Flight completion rate (%)" metric.
+# 3. Aggregates results across random seeds, calculating the mean and
+#    standard deviation for each crew configuration and absence level.
+# 4. Generates two error-bar plots:
+#      - Plot 1 compares different active crew / reserve crew mixes
+#        while keeping total crew constant
+#        (28 AC + 4 RC, 30 AC + 2 RC, 32 AC + 0 RC).
+#      - Plot 2 compares increasing reserve crew levels while keeping
+#        active crew fixed
+#        (32 AC + 0 RC, 32 AC + 2 RC, 32 AC + 4 RC).
+# 5. Displays variability across simulation seeds using standard
+#    deviation error bars.
+# 6. Saves the plots as high-resolution PNG files suitable for reports,
+#    academic papers, or presentations.
+#
+# Output files:
+#   - flight_completion_vs_absence_plot1_varying_ac.png
+#   - flight_completion_vs_absence_plot2_varying_rc.png
+# ------------------------------------------------------------------
+
 from matplotlib.lines import Line2D
 import pandas as pd
 import matplotlib.pyplot as plt

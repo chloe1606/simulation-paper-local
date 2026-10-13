@@ -1,3 +1,56 @@
+# --------------------------------------------------
+# PURPOSE
+# --------------------------------------------------
+# This script automates the analysis and visualisation of crew
+# resilience simulation results stored in Excel workbooks.
+#
+# The script:
+# 1. Automatically locates and loads the most recently generated
+#    simulation results file from the output directory.
+# 2. Cleans and converts metric values into a consistent numeric format.
+# 3. Aggregates results across simulation runs/seeds, calculating
+#    mean performance and standard deviation for each scenario.
+# 4. Produces publication-quality error-bar charts for key operational
+#    metrics, including:
+#       - Duty coverage
+#       - Flight completion rate
+#       - Delay propagation factor
+#       - Schedule recovery time
+#       - Total delay
+#       - Flight cancellations
+#       - Crew utilisation metrics
+#       - Other resilience and recovery indicators
+# 5. Generates individual figures for each metric and active crew
+#    configuration, showing performance against a selected independent
+#    variable (reserve crew, absence probability, or delay probability).
+# 6. Creates combined multi-panel figures that display all key metrics
+#    in a single dashboard view for each active crew level.
+# 7. Exports all figures as high-resolution PNG files suitable for
+#    academic publications, reports, and presentations.
+# 8. Produces summary statistics tables containing mean and standard
+#    deviation results for all scenarios.
+# 9. Generates publication-ready tables using the format:
+#       Mean ± Standard Deviation
+# 10. Creates a pivot table summary for duty coverage to support
+#     scenario comparison and reporting.
+#
+# Key outputs:
+#   - Individual metric charts (.png)
+#   - Combined multi-metric dashboard figures (.png)
+#   - Scenario summary statistics
+#   - Paper-ready summary tables
+#   - Duty coverage comparison tables
+#
+# Configuration:
+#   X_AXIS can be changed to:
+#     - reserve_crew
+#     - absence_prob
+#     - delay_prob
+#
+# allowing the same analysis framework to compare resilience
+# performance across different experimental factors.
+# --------------------------------------------------
+
 import re
 from pathlib import Path
 
